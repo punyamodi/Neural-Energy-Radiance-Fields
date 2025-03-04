@@ -7,43 +7,62 @@ from torch.utils.data import DataLoader
 import os
 from skimage.metrics import structural_similarity as compare_ssim
 import lpips  # pip install lpips
-import csv
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-##########################################
-# B-Spline encoding routines (unchanged)
-##########################################
+#############################
+# B-Spline encoding routines
+#############################
 def bspline_basis(x, degree, n_basis, eps=1e-8):
     """
     Compute the B-spline basis functions for a 1D tensor x.
     Assumes x is in [0,1]. Uses the Cox–de Boor recursion.
+
+    Args:
+        x: tensor of shape (N,) containing evaluation points in [0,1]
+        degree: the degree of the B-spline (e.g. 3 for cubic)
+        n_basis: number of basis functions.
+        eps: small constant to avoid division by zero.
+
+    Returns:
+        B: tensor of shape (N, n_basis) with the B-spline basis values.
     """
+    # Ensure x is a 1D tensor of shape (N,)
     if x.dim() > 1:
         x = x.squeeze(-1)
     N = x.shape[0]
     n_knots = n_basis + degree + 1
+    # Build an open uniform knot vector in [0,1]
     if n_basis - degree - 1 > 0:
+        # interior knots: choose (n_basis - degree - 1) knots uniformly in (0,1)
         interior = torch.linspace(0, 1, n_basis - degree + 1, device=x.device)[1:-1]
     else:
         interior = torch.tensor([], device=x.device)
     knots = torch.cat([torch.zeros(degree+1, device=x.device), interior, torch.ones(degree+1, device=x.device)])
-    x_exp = x.unsqueeze(1)
+    # Compute degree-0 basis functions.
+    x_exp = x.unsqueeze(1)  # shape (N, 1)
     knots_i = knots[:n_basis].view(1, -1)
     knots_ip1 = knots[1:n_basis+1].view(1, -1)
-    B = ((x_exp >= knots_i) & (x_exp < knots_ip1)).float()
+    B = ((x_exp >= knots_i) & (x_exp < knots_ip1)).float()  # shape (N, n_basis)
+    # Special case: for x==1, assign the last basis function to 1.
     idx = (x == 1)
     if idx.any():
         B[idx] = 0.0
         B[idx, -1] = 1.0
+
+    # Recursively compute basis functions for degrees 1,2,...,degree.
     for d in range(1, degree+1):
+        # left term: (x - knots[i]) / (knots[i+d] - knots[i]) * B_{i,d-1}
         left_num = x_exp - knots[:n_basis].view(1, -1)
         left_denom = knots[d:n_basis+d] - knots[:n_basis]
         left_denom = left_denom.view(1, -1)
         left_term = (left_num / (left_denom + eps)) * B
+
+        # right term: (knots[i+d+1] - x) / (knots[i+d+1] - knots[i+1]) * B_{i+1,d-1}
         right_num = knots[d+1:n_basis+d+1].view(1, -1) - x_exp
         right_denom = knots[d+1:n_basis+d+1] - knots[1:n_basis+1]
         right_denom = right_denom.view(1, -1)
+        # B_{i+1,d-1}: pad with zeros so that dimensions match.
         B_right = (right_num / (right_denom + eps)) * torch.cat([B[:, 1:], torch.zeros(N, 1, device=x.device)], dim=1)
         B = left_term + B_right
     return B
@@ -51,10 +70,25 @@ def bspline_basis(x, degree, n_basis, eps=1e-8):
 def bspline_encoding(x, degree, n_basis, include_input=True):
     """
     Apply B-spline encoding to each coordinate of x.
+    Assumes that the input x (of shape [N, D]) is in the range [-1,1]. It is first
+    normalized to [0,1] (since B-spline basis functions are defined on [0,1]).
+    
+    For each coordinate, the raw is (optionally) concatenated with the evaluated
+    B-spline basis (of dimension n_basis), so that each coordinate yields (1+n_basis) features.
+    
+    Args:
+        x: tensor of shape (N, D)
+        degree: degree of the B-spline (e.g. 3 for cubic)
+        n_basis: number of basis functions per coordinate.
+        include_input: if True, the raw coordinate is concatenated with the basis values.
+        
+    Returns:
+        Tensor of shape (N, D*(1+n_basis)) if include_input is True, else (N, D*n_basis)
     """
     encodings = []
     for i in range(x.shape[1]):
         xi = x[:, i:i+1]
+        # Normalize from [-1,1] to [0,1].
         xi_norm = (xi + 1) / 2  
         basis = bspline_basis(xi_norm.squeeze(-1), degree, n_basis)
         if include_input:
@@ -63,69 +97,9 @@ def bspline_encoding(x, degree, n_basis, include_input=True):
             encodings.append(basis)
     return torch.cat(encodings, dim=1)
 
-###############################################
-# Kolmogorov-Arnold Network (KA) module
-###############################################
-class KolmogorovArnoldLayer(nn.Module):
-    """
-    A simple implementation of a Kolmogorov-Arnold layer.
-    It approximates a function f(x) (with x in R^d) as
-        f(x) = sum_{q=0}^{2*d} φ_q ( sum_{p=1}^{d} ψ_{q,p}(x_p) )
-    where each ψ_{q,p} and φ_q is implemented as a small MLP.
-    """
-    def __init__(self, input_dim, output_dim, num_terms=None, hidden_dim=32):
-        """
-        Args:
-            input_dim: the dimension of the input (d)
-            output_dim: the dimension of the output
-            num_terms: number of terms in the sum; by default 2*input_dim+1.
-            hidden_dim: hidden dimension for the univariate networks.
-        """
-        super(KolmogorovArnoldLayer, self).__init__()
-        self.input_dim = input_dim
-        if num_terms is None:
-            num_terms = 2 * input_dim + 1
-        self.num_terms = num_terms
-        self.hidden_dim = hidden_dim
-
-        # Create a collection of univariate networks ψ_{q,p} for each term q and coordinate p.
-        self.psi = nn.ModuleList()
-        for q in range(self.num_terms):
-            psi_q = nn.ModuleList()
-            for p in range(input_dim):
-                psi_q.append(nn.Sequential(
-                    nn.Linear(1, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, 1)
-                ))
-            self.psi.append(psi_q)
-        
-        # Create the outer functions φ_q.
-        self.phi = nn.ModuleList()
-        for q in range(self.num_terms):
-            self.phi.append(nn.Sequential(
-                nn.Linear(1, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim)
-            ))
-    
-    def forward(self, x):
-        # x: [N, input_dim]
-        N = x.shape[0]
-        device = x.device
-        out = torch.zeros(N, self.phi[0][-1].out_features, device=device)
-        for q in range(self.num_terms):
-            sum_val = torch.zeros(N, 1, device=device)
-            for p in range(self.input_dim):
-                xp = x[:, p:p+1]  # shape: (N,1)
-                sum_val = sum_val + self.psi[q][p](xp)
-            term = self.phi[q](sum_val)
-            out = out + term
-        return out
-
-###############################################
-# NeRF model with options for B-spline and KA encoding
-###############################################
+###########################################
+# NeRF model with option for B-spline encoding
+###########################################
 class NerfModel(nn.Module):
     def __init__(self, 
                  embedding_dim_pos=10, 
@@ -135,58 +109,34 @@ class NerfModel(nn.Module):
                  bspline_degree=3,
                  bspline_num_basis=None,   # if None, will be set to 2*embedding_dim_pos
                  bspline_degree_dir=3,
-                 bspline_num_basis_dir=None,  # if None, will be set to 2*embedding_dim_direction
-                 use_kolmogorov=False,
-                 ka_hidden_dim=32  # hidden dimension for KA sub-networks
+                 bspline_num_basis_dir=None  # if None, will be set to 2*embedding_dim_direction
                 ):   
         super(NerfModel, self).__init__()
+        
         self.use_bspline = use_bspline
-        self.use_kolmogorov = use_kolmogorov
-
-        # Choose the input dimension for positions.
-        if self.use_kolmogorov:
-            # With KA we use the raw coordinate (assumed in [-1,1]).
-            input_dim_pos = 3
-            self.ka_layer = KolmogorovArnoldLayer(input_dim=3, output_dim=hidden_dim, 
-                                                   num_terms=2*3+1, hidden_dim=ka_hidden_dim)
-            # In this case, we do not use a standard block1 MLP.
-            self.block1 = nn.Identity()
-        elif self.use_bspline:
+        if self.use_bspline:
             self.bspline_degree = bspline_degree
             self.bspline_num_basis = bspline_num_basis if bspline_num_basis is not None else 2 * embedding_dim_pos
-            input_dim_pos = 3 * (1 + self.bspline_num_basis)
-            self.block1 = nn.Sequential(
-                nn.Linear(input_dim_pos, hidden_dim), 
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), 
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), 
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), 
-                nn.ReLU(),
-            )
-        else:
-            input_dim_pos = 3 * (1 + 2 * embedding_dim_pos)
-            self.block1 = nn.Sequential(
-                nn.Linear(input_dim_pos, hidden_dim), 
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), 
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), 
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim), 
-                nn.ReLU(),
-            )
-        
-        # For directions we still use either B-spline or sine-cosine.
-        if self.use_bspline:
             self.bspline_degree_dir = bspline_degree_dir
             self.bspline_num_basis_dir = bspline_num_basis_dir if bspline_num_basis_dir is not None else 2 * embedding_dim_direction
+            # Each coordinate becomes (1+n_basis) features.
+            input_dim_pos = 3 * (1 + self.bspline_num_basis)
             input_dim_dir = 3 * (1 + self.bspline_num_basis_dir)
         else:
+            # Standard sine–cosine positional encoding.
+            input_dim_pos = 3 * (1 + 2 * embedding_dim_pos)
             input_dim_dir = 3 * (1 + 2 * embedding_dim_direction)
         
-        # Block2 processes the combination of the (encoded) positional input and its hidden representation.
+        self.block1 = nn.Sequential(
+            nn.Linear(input_dim_pos, hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.ReLU(),
+        )
         self.block2 = nn.Sequential(
             nn.Linear(input_dim_pos + hidden_dim, hidden_dim), 
             nn.ReLU(),
@@ -217,41 +167,32 @@ class NerfModel(nn.Module):
         return torch.cat(out, dim=1)
 
     def forward(self, o, d):
-        # For positions:
-        if self.use_kolmogorov:
-            # Use raw coordinates and pass through the KA layer.
-            emb_x = o  # raw input of shape [N,3]
-            hidden = self.ka_layer(emb_x)  # output shape: [N, hidden_dim]
-        elif self.use_bspline:
-            emb_x = bspline_encoding(o, self.bspline_degree, self.bspline_num_basis, include_input=True)
-            hidden = self.block1(emb_x)
-        else:
-            emb_x = self.positional_encoding(o, self.embedding_dim_pos)
-            hidden = self.block1(emb_x)
-        # For directions:
         if self.use_bspline:
+            # Use B-spline encoding (assuming inputs in [-1,1]).
+            emb_x = bspline_encoding(o, self.bspline_degree, self.bspline_num_basis, include_input=True)
             emb_d = bspline_encoding(d, self.bspline_degree_dir, self.bspline_num_basis_dir, include_input=True)
         else:
+            emb_x = self.positional_encoding(o, self.embedding_dim_pos)
             emb_d = self.positional_encoding(d, self.embedding_dim_direction)
-        # Combine positional encoding and hidden representation.
-        tmp = self.block2(torch.cat((emb_x, hidden), dim=1))
+        h = self.block1(emb_x)
+        tmp = self.block2(torch.cat((h, emb_x), dim=1))
         h, sigma = tmp[:, :-1], self.relu(tmp[:, -1])
         h = self.block3(torch.cat((h, emb_d), dim=1))
         c = self.block4(h)
         return c, sigma
 
-###############################################
+############################################
 # Rendering and testing routines
-###############################################
+############################################
+
 @torch.no_grad()
-def test(hn, hf, dataset, model, lpips_loss, chunk_size=10, img_index=0, nb_bins=192, H=400, W=400, 
-         save_path="novel_views", csv_path="test_metrics.csv", epoch=0):
+def test(hn, hf, dataset, model, lpips_loss, chunk_size=10, img_index=0, nb_bins=192, H=400, W=400, save_path="novel_views"):
     """
     Render an image from a novel view given an index.
     Also computes PSNR, SSIM, and LPIPS metrics against the ground truth.
-    The metrics are logged to a CSV file.
     """
     device = next(model.parameters()).device
+    # Extract rays for this view.
     start = img_index * H * W
     end = (img_index + 1) * H * W
     ray_origins = dataset[start:end, :3]
@@ -269,8 +210,10 @@ def test(hn, hf, dataset, model, lpips_loss, chunk_size=10, img_index=0, nb_bins
     pred = torch.cat(data)  # [N, 3]
     img = pred.data.cpu().numpy().reshape(H, W, 3)
     
+    # Get ground truth image.
     gt = gt_pixels.data.cpu().numpy().reshape(H, W, 3)
     
+    # Save the rendered image.
     os.makedirs(save_path, exist_ok=True)
     plt.figure()
     plt.imshow(img)
@@ -278,23 +221,21 @@ def test(hn, hf, dataset, model, lpips_loss, chunk_size=10, img_index=0, nb_bins
     plt.savefig(os.path.join(save_path, f'img_{img_index}.png'), bbox_inches='tight', pad_inches=0)
     plt.close()
     
-    # Compute PSNR.
+    # ----- Compute metrics -----
+    # PSNR computation (assume pixel values in [0,1]).
     mse = np.mean((img - gt) ** 2)
-    psnr = -10 * np.log10(mse + 1e-8)
-    # Compute SSIM.
+    psnr = -10 * np.log10(mse + 1e-8)  # avoid log(0)
+    
+    # SSIM computation using skimage.
+    # Use channel_axis=-1 and explicitly set win_size=7.
     ssim = compare_ssim(gt, img, channel_axis=-1, data_range=1.0, win_size=7)
-    # Compute LPIPS.
+    
+    # LPIPS computation using lpips.
+    # Convert images to torch tensors, scale to [-1,1] (lpips expects this range), and add batch dimension.
     pred_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device) * 2 - 1.
     gt_tensor = torch.from_numpy(gt).permute(2, 0, 1).unsqueeze(0).to(device) * 2 - 1.
-    lpips_val = lpips_loss(pred_tensor, gt_tensor).item()
-
-    # Log the metrics to a CSV file.
-    file_exists = os.path.isfile(csv_path)
-    with open(csv_path, 'a', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        if not file_exists:
-            writer.writerow(["epoch", "view_index", "psnr", "ssim", "lpips"])
-        writer.writerow([epoch, img_index, psnr, ssim, lpips_val])
+    lpips_val = lpips_loss(pred_tensor, gt_tensor)
+    lpips_val = lpips_val.item()
 
     print(f"View {img_index}: PSNR: {psnr:.3f} dB, SSIM: {ssim:.3f}, LPIPS: {lpips_val:.3f}")
     return psnr, ssim, lpips_val
@@ -320,6 +261,7 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
                        torch.tensor([1e10], device=device).expand(ray_origins.shape[0], 1)), -1)
 
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)
+    # Expand 'ray_directions' to match the shape of x.
     ray_directions_exp = ray_directions.expand(nb_bins, ray_directions.shape[0], 3).transpose(0, 1) 
 
     colors, sigma = nerf_model(x.reshape(-1, 3), ray_directions_exp.reshape(-1, 3))
@@ -328,14 +270,16 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
 
     alpha = 1 - torch.exp(-sigma * delta)  # [batch_size, nb_bins]
     weights = compute_accumulated_transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
+    # Compute the pixel values as a weighted sum of colors along each ray.
     c = (weights * colors).sum(dim=1)
-    weight_sum = weights.sum(-1).sum(-1)
+    weight_sum = weights.sum(-1).sum(-1)  # Regularization for white background 
     return c + 1 - weight_sum.unsqueeze(-1)
 
 def train(nerf_model, optimizer, scheduler, data_loader, device='cpu', hn=0, hf=1, nb_epochs=int(1e5),
-          nb_bins=192, H=400, W=400, testing_dataset=None, lpips_loss=None, csv_path="test_metrics.csv"):
+          nb_bins=192, H=400, W=400, testing_dataset=None, lpips_loss=None):
     training_loss = []
     for epoch in range(nb_epochs):
+        # Create a tqdm progress bar for the inner loop over batches.
         pbar = tqdm(data_loader, desc=f"Epoch {epoch+1}/{nb_epochs}", leave=False)
         for batch in pbar:
             ray_origins = batch[:, :3].to(device)
@@ -352,13 +296,13 @@ def train(nerf_model, optimizer, scheduler, data_loader, device='cpu', hn=0, hf=
             pbar.set_postfix(loss=loss.item())
         scheduler.step()
 
+        # If a testing dataset is provided, render all available test views and evaluate metrics.
         if testing_dataset is not None:
             num_views = testing_dataset.shape[0] // (H * W)
             metrics = []
             for img_index in range(num_views):
                 psnr, ssim_val, lpips_val = test(hn, hf, testing_dataset, nerf_model, lpips_loss,
-                                                 img_index=img_index, nb_bins=nb_bins, H=H, W=W, 
-                                                 csv_path=csv_path, epoch=epoch+1)
+                                                 img_index=img_index, nb_bins=nb_bins, H=H, W=W)
                 metrics.append((psnr, ssim_val, lpips_val))
             avg_psnr = np.mean([m[0] for m in metrics])
             avg_ssim = np.mean([m[1] for m in metrics])
@@ -367,38 +311,33 @@ def train(nerf_model, optimizer, scheduler, data_loader, device='cpu', hn=0, hf=
         print(f"Epoch {epoch+1}/{nb_epochs} completed.")
     return training_loss
 
-###############################################
-# Main – choose whether to use B-spline or KA encoding
-###############################################
+####################################
+# Main – choose whether to use B-spline encoding or not
+####################################
 if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     training_dataset = torch.from_numpy(np.load('training_data.pkl', allow_pickle=True))
     testing_dataset = torch.from_numpy(np.load('testing_data.pkl', allow_pickle=True))
     
-    # Choose your encoding:
-    # To use B-spline encoding, set use_bspline=True.
-    # To use Kolmogorov-Arnold encoding, set use_kolmogorov=True.
-    # (These options are mutually exclusive.)
+    # Set use_bspline=True to use the B-spline encoding.
     model = NerfModel(hidden_dim=256, 
                       embedding_dim_pos=10, 
                       embedding_dim_direction=4,
-                      use_bspline=True,       # set to True to use B-spline encoding
-                      use_kolmogorov=True,       # set to True to use KA encoding
-                      bspline_degree=3,       
-                      bspline_num_basis=20,   
+                      use_bspline=True,       # Use B-spline encoding
+                      bspline_degree=3,       # Cubic B-spline
+                      bspline_num_basis=20,   # e.g. 2*embedding_dim_pos (10*2)
                       bspline_degree_dir=3,
-                      bspline_num_basis_dir=8,
-                      ka_hidden_dim=32          # hidden dimension for KA networks
+                      bspline_num_basis_dir=8 # e.g. 2*embedding_dim_direction (4*2)
                      ).to(device)
     
     model_optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(model_optimizer, milestones=[2, 4, 8], gamma=0.5)
     data_loader = DataLoader(training_dataset, batch_size=1024, shuffle=True)
     
+    # Create an instance of the LPIPS metric once (to avoid reloading the network every evaluation).
     lpips_loss = lpips.LPIPS(net='alex').to(device)
     
-    # Run training (here for 1 epoch; adjust nb_epochs as needed)
-    train(model, model_optimizer, scheduler, data_loader, nb_epochs=1, device=device, 
-          hn=2, hf=6, nb_bins=192, H=400, W=400, testing_dataset=testing_dataset, 
-          lpips_loss=lpips_loss, csv_path="test_metrics.csv")
+    # Run training for 1 epoch (adjust nb_epochs as needed)
+    train(model, model_optimizer, scheduler, data_loader, nb_epochs=16, device=device, 
+          hn=2, hf=6, nb_bins=192, H=400, W=400, testing_dataset=testing_dataset, lpips_loss=lpips_loss)

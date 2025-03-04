@@ -339,5 +339,5 @@ if __name__ == '__main__':
     lpips_loss = lpips.LPIPS(net='alex').to(device)
     
     # Run training for 1 epoch (adjust nb_epochs as needed)
-    train(model, model_optimizer, scheduler, data_loader, nb_epochs=16, device=device, 
+    train(model, model_optimizer, scheduler, data_loader, nb_epochs=1, device=device, 
           hn=2, hf=6, nb_bins=192, H=400, W=400, testing_dataset=testing_dataset, lpips_loss=lpips_loss)
