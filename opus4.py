@@ -373,7 +373,7 @@ if __name__ == '__main__':
         print(f"  B-spline pos encoder using {model.bspline_pos_encoder.num_bases_per_dim} bases per dim.")
         print(f"  B-spline dir encoder using {model.bspline_dir_encoder.num_bases_per_dim} bases per dim.")
 
-    num_epochs_train = 1 # Set to a low number for quick testing
+    num_epochs_train = 16 # Set to a low number for quick testing
     
     # Number of novel views to render after each epoch
     # If using dummy data, num_dummy_test_imgs (e.g., 1) will be the max.
@@ -382,7 +382,7 @@ if __name__ == '__main__':
 
 
     near_plane, far_plane = 2., 6.
-    num_bins_render = 10
+    num_bins_render = 192
     chunk_size_test_final = 10 # Chunk size for the final test render after all epochs
 
     training_losses = train(model, model_optimizer, scheduler, data_loader, 
